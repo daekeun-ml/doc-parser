@@ -37,12 +37,75 @@ def _call_gemini(client, model_id: str, system: str, user: str) -> str:
     return response.text
 
 
+def _extract_images_from_json(sheet_json: dict) -> tuple:
+    """sheet JSON에서 이미지/차트 노드를 분리.
+
+    Returns:
+        (cleaned_json, images) — 이미지 제거된 JSON과 이미지 노드 리스트
+    """
+    images = []
+    cleaned_rows = []
+    for item in sheet_json.get("rows", []):
+        if isinstance(item, dict) and item.get("type") in ("image", "chart"):
+            images.append(item)
+        else:
+            cleaned_rows.append(item)
+
+    cleaned = dict(sheet_json)
+    cleaned["rows"] = cleaned_rows
+    return cleaned, images
+
+
+def _insert_images_md(text: str, images: list) -> str:
+    """Gemini 재구성 결과에 이미지를 삽입.
+
+    이미지는 문서 summary 뒤, 본문 시작 전에 배치.
+    """
+    if not images:
+        return text
+
+    img_lines = []
+    for img in images:
+        if img.get("type") == "chart":
+            chart_type = img.get("chart_type", "Chart")
+            title = img.get("title", "")
+            img_lines.append(f"**[{chart_type}]** {title}\n")
+        else:
+            filename = img.get("filename", "")
+            summary = img.get("summary", "")
+            if not filename:
+                continue
+            alt = summary or "이미지"
+            img_lines.append(f"![{alt}]({filename})\n")
+
+    if not img_lines:
+        return text
+
+    img_block = "\n".join(img_lines)
+
+    # summary 블록(첫 번째 문단) 뒤에 삽입 시도, 없으면 문서 앞에
+    lines = text.split("\n")
+    insert_idx = 0
+    for i, line in enumerate(lines):
+        # 첫 번째 빈 줄(summary 끝)을 찾으면 그 뒤에 삽입
+        if i > 0 and line.strip() == "" and lines[i - 1].strip():
+            insert_idx = i + 1
+            break
+    else:
+        insert_idx = 0
+
+    lines.insert(insert_idx, "\n" + img_block)
+    return "\n".join(lines)
+
+
 def reconstruct_sheet(
     sheet_json: dict,
     output_format: str,
     model_id: str = "gemini-2.5-flash",
 ) -> str:
     """단일 시트 JSON을 Gemini로 재구성.
+
+    이미지/차트는 Gemini에 보내지 않고, 후처리로 삽입.
 
     Args:
         sheet_json: _sheet_to_compact() 결과 dict
@@ -52,12 +115,15 @@ def reconstruct_sheet(
     Returns:
         재구성된 Markdown 또는 HTML 문자열
     """
+    # 이미지/차트 분리 → Gemini는 테이블/텍스트 재구성에만 집중
+    cleaned_json, images = _extract_images_from_json(sheet_json)
+
     prompts = _load_prompts()
     prompt_key = "reconstruct_md" if output_format == "md" else "reconstruct_html"
     prompt = prompts[prompt_key]
 
-    sheet_name = sheet_json.get("sheet_name", "Sheet")
-    json_content = json.dumps(sheet_json, ensure_ascii=False, indent=2)
+    sheet_name = cleaned_json.get("sheet_name", "Sheet")
+    json_content = json.dumps(cleaned_json, ensure_ascii=False, indent=2)
 
     system = prompt["system"]
     user = prompt["user"].format(
@@ -81,52 +147,11 @@ def reconstruct_sheet(
     if result.endswith("```"):
         result = result[:-3].strip()
 
-    # 이미지 summary 후처리: Gemini 출력에 의존하지 않고 확정적으로 반영
+    # 이미지/차트 후처리 삽입
     if output_format == "md":
-        result = _ensure_image_summaries_md(result, sheet_json)
+        result = _insert_images_md(result, images)
 
     return result
-
-
-def _ensure_image_summaries_md(text: str, sheet_json: dict) -> str:
-    """Gemini 재구성 결과에 이미지 summary가 정확히 반영되도록 후처리.
-
-    1) Gemini가 이미지를 출력했으면 → alt text를 summary로 교체
-    2) Gemini가 이미지를 누락했으면 → 문서 끝에 추가
-    """
-    # sheet JSON에서 이미지 노드 추출
-    images = []
-    for item in sheet_json.get("rows", []):
-        if isinstance(item, dict) and item.get("type") == "image":
-            images.append(item)
-
-    if not images:
-        return text
-
-    for img in images:
-        filename = img.get("filename", "")
-        summary = img.get("summary", "")
-        if not filename:
-            continue
-
-        # 파일명이 결과에 있는지 찾기
-        # ![아무텍스트](filename) 또는 ![아무텍스트](경로/filename) 패턴
-        escaped = re.escape(filename)
-        pattern = re.compile(r'!\[([^\]]*)\]\(([^)]*' + escaped + r'[^)]*)\)')
-        match = pattern.search(text)
-
-        if match:
-            if summary:
-                # alt text를 summary로 교체
-                old = match.group(0)
-                new = f"![{summary}]({match.group(2)})"
-                text = text.replace(old, new, 1)
-        else:
-            # Gemini가 이미지를 누락 → 문서 끝에 추가
-            alt = summary or "이미지"
-            text += f"\n\n![{alt}]({filename})\n"
-
-    return text
 
 
 def reconstruct_all_sheets(

@@ -69,7 +69,9 @@ flowchart TB
 
     subgraph RECONSTRUCT["6. 재구성 (선택)"]
         direction TB
-        RC["reconstructor.py<br/>Compact JSON(요약 포함) → Gemini<br/>→ Clean MD + HTML"]
+        RC["reconstructor.py<br/>Compact JSON(요약 포함) → Gemini<br/>→ Clean MD"]
+        POST["후처리<br/>_ensure_image_summaries_md()<br/>이미지 요약 확정 반영"]
+        RC --> POST
     end
 
     INPUT --> PARSE --> AST_LAYER
@@ -94,7 +96,7 @@ uv run python run.py docs/sample.xlsx -o output
 # Compact JSON 출력 (RAG용)
 uv run python run.py docs/sample.xlsx -o output --to-json
 
-# JSON + Gemini 재구성 (clean MD/HTML 동시 생성)
+# JSON + Gemini 재구성 (clean MD 생성)
 uv run python run.py docs/sample.xlsx -o output --to-json --reconstruct
 
 # 요약 비활성화 (API 호출 없이 빠르게)
@@ -106,10 +108,11 @@ uv run python run.py docs/sample.xlsx -o output --to-json --no-summary
 | `--to-json` | RAG 최적화 Compact JSON 출력 |
 | `--to-html` | 스타일 포함 HTML 출력 |
 | `--to-markdown` | Markdown 출력 (기본값) |
-| `--reconstruct` | JSON 기반으로 Gemini가 clean MD + HTML 재생성 |
+| `--to-text` | 플레인 텍스트 출력 |
+| `--reconstruct` | Compact JSON 기반으로 Gemini가 clean MD 재생성 |
 | `--no-summary` | Gemini 요약 비활성화 |
 | `--model-id` | 사용할 Gemini 모델 (기본: gemini-2.5-flash) |
-| `-v` | DEBUG 로깅 활성화 |
+| `-v` | DEBUG 로깅 활성화 (log/ 디렉토리에 파일 저장) |
 
 ---
 
@@ -302,9 +305,11 @@ AST에서 3가지 포맷으로 변환됩니다. 모두 `types.py`의 메서드�
   "type": "xlsx",
   "sheets": [{
     "sheet_name": "WBS공정표",
+    "summary": "WBS 공정표 시트 요약...",
     "rows": [
       {"r": 4, "cells": {"1": "1", "2": "기획", "3": "요구사항 분석"}, "bg": {"7": "#00B050"}},
-      {"r": 5, "cells": {"1": "1.1", "3": "이해관계자 인터뷰"}, "bg": {"7": "#00B050"}}
+      {"r": 5, "cells": {"1": "1.1", "3": "이해관계자 인터뷰"}, "bg": {"7": "#00B050"}, "cs": {"2": 3}},
+      {"type": "image", "filename": "WBS_image_0.png", "summary": "이미지 요약..."}
     ]
   }]
 }
@@ -313,7 +318,9 @@ AST에서 3가지 포맷으로 변환됩니다. 모두 `types.py`의 메서드�
 **특징:**
 - 빈 셀 완전 제거 → 토큰 절약
 - col 번호 기반 매핑 → 열 밀림 없음 (헤더 감지 불필요)
-- 배경색 별도 `bg` 객체로 분리
+- 배경색 별도 `bg` 객체로 분리, colspan은 `cs` 객체로 분리
+- 시트 요약(`summary`), 이미지 요약(`summary`) 포함
+- 이미지/차트 노드가 rows 배열 내 위치에 맞게 삽입
 - LLM이 구조를 정확하게 이해할 수 있는 형태
 
 **왜 헤더를 key로 안 쓰나요?**
@@ -384,15 +391,17 @@ Gemini 출력에만 의존하면 이미지 요약이 누락될 수 있으므로,
 
 ```
 output/{파일명}/
-├── {파일명}.json                    # Compact JSON (RAG 소스)
-├── {파일명}.md                      # Raw Markdown
-├── {파일명}.html                    # Styled HTML
-├── {파일명}_reconstructed.md        # Gemini 재구성 MD (--reconstruct)
-├── {파일명}_reconstructed.html      # Gemini 재구성 HTML (--reconstruct)
+├── {파일명}.json                    # Compact JSON (RAG 소스) — --to-json
+├── {파일명}.md                      # Raw Markdown — --to-markdown (기본값)
+├── {파일명}.html                    # Styled HTML — --to-html
+├── {파일명}.txt                     # 플레인 텍스트 — --to-text
+├── {파일명}_reconstructed.md        # Gemini 재구성 MD — --reconstruct
 └── pictures/                        # 추출된 이미지
     ├── {시트명}_image_0.png
     └── ...
 ```
+
+> **참고:** 출력 포맷은 하나만 선택됩니다 (json/md/html/text 중 하나). `--reconstruct`는 선택된 포맷과 별도로 `_reconstructed.md`를 추가 생성합니다.
 
 ---
 
@@ -432,6 +441,8 @@ Excel에서 실제 셀 병합(`ws.merged_cells`)을 쓰지 않고 시각적으�
 | 셀 스타일 추출 실패 | style = None으로 진행 |
 | Gemini 요약 실패 | 해당 요약만 스킵, 로그 경고 |
 | 테마 색상 추출 실패 | 빈 리스트로 진행 (테마색 무시) |
+| Reconstruct 시트 실패 | 해당 시트만 `<!-- Reconstruct failed -->` 처리, 나머지 시트는 정상 진행 |
+| Reconstruct 전체 실패 | 로그 에러, 재구성 MD 미생성 (원본 출력은 영향 없음) |
 
 ---
 
