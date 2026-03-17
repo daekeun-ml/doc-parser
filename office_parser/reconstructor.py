@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -77,7 +78,52 @@ def reconstruct_sheet(
     if result.endswith("```"):
         result = result[:-3].strip()
 
+    # 이미지 summary 후처리: Gemini 출력에 의존하지 않고 확정적으로 반영
+    if output_format == "md":
+        result = _ensure_image_summaries_md(result, sheet_json)
+
     return result
+
+
+def _ensure_image_summaries_md(text: str, sheet_json: dict) -> str:
+    """Gemini 재구성 결과에 이미지 summary가 정확히 반영되도록 후처리.
+
+    1) Gemini가 이미지를 출력했으면 → alt text를 summary로 교체
+    2) Gemini가 이미지를 누락했으면 → 문서 끝에 추가
+    """
+    # sheet JSON에서 이미지 노드 추출
+    images = []
+    for item in sheet_json.get("rows", []):
+        if isinstance(item, dict) and item.get("type") == "image":
+            images.append(item)
+
+    if not images:
+        return text
+
+    for img in images:
+        filename = img.get("filename", "")
+        summary = img.get("summary", "")
+        if not filename:
+            continue
+
+        # 파일명이 결과에 있는지 찾기
+        # ![아무텍스트](filename) 또는 ![아무텍스트](경로/filename) 패턴
+        escaped = re.escape(filename)
+        pattern = re.compile(r'!\[([^\]]*)\]\(([^)]*' + escaped + r'[^)]*)\)')
+        match = pattern.search(text)
+
+        if match:
+            if summary:
+                # alt text를 summary로 교체
+                old = match.group(0)
+                new = f"![{summary}]({match.group(2)})"
+                text = text.replace(old, new, 1)
+        else:
+            # Gemini가 이미지를 누락 → 문서 끝에 추가
+            alt = summary or "이미지"
+            text += f"\n\n![{alt}]({filename})\n"
+
+    return text
 
 
 def reconstruct_all_sheets(

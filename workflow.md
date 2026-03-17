@@ -62,19 +62,20 @@ flowchart TB
 
     subgraph OUTPUT["5. 출력 (types.py)"]
         direction TB
-        JSON_OUT["to_json_compact()<br/>→ RAG용 압축 JSON"]
+        JSON_OUT["to_json_compact()<br/>→ RAG용 압축 JSON<br/>(시트 요약 + 이미지 요약 포함)"]
         MD_OUT["to_markdown()<br/>→ 사람 읽기용"]
         HTML_OUT["to_html()<br/>→ 브라우저 뷰"]
     end
 
     subgraph RECONSTRUCT["6. 재구성 (선택)"]
         direction TB
-        RC["reconstructor.py<br/>Compact JSON → Gemini<br/>→ Clean MD + HTML"]
+        RC["reconstructor.py<br/>Compact JSON(요약 포함) → Gemini<br/>→ Clean MD + HTML"]
     end
 
     INPUT --> PARSE --> AST_LAYER
     AST_LAYER --> SUMMARY
-    AST_LAYER --> OUTPUT
+    SUMMARY -->|"요약이 AST에 반영"| OUTPUT
+    AST_LAYER -->|"요약 없이"| OUTPUT
     OUTPUT --> RECONSTRUCT
 ```
 
@@ -341,20 +342,41 @@ CSS 테마 포함 완성 HTML. 인라인 스타일로 원본 배경색/글자색
 `--reconstruct` 플래그를 주면 **Compact JSON을 Gemini에게 보내서 깔끔한 MD/HTML로 재생성**합니다.
 
 ```
-Compact JSON (col 기반, 구조 정확)
-    ↓ Gemini 2.5 Flash
-Clean MD (빈 셀 제거, 테이블 분리, 계층 구조 표현)
-Clean HTML (스타일링, rowspan/colspan)
+Compact JSON (col 기반, 구조 정확, 이미지 요약 포함)
+    ↓ Gemini 2.5 Flash (시트별 병렬)
+    ↓
+Gemini 출력 (MD/HTML)
+    ↓ 후처리: _ensure_image_summaries_md()
+    ↓  ├── Gemini가 이미지 출력함 → alt text를 image_summary로 교체
+    ↓  └── Gemini가 이미지 누락함 → 문서 끝에 summary와 함께 추가
+    ↓
+Clean MD (빈 셀 제거, 테이블 분리, 계층 구조 표현, 이미지 요약 확정 반영)
+Clean HTML (스타일링, rowspan/colspan) ※ 이미지 요약 후처리 미적용
 ```
 
 **프롬프트는 `prompts.yaml`에 관리됩니다.** 프롬프트를 수정하면 재구성 품질을 튜닝할 수 있습니다.
 
 **Gemini가 하는 일:**
 1. 한 시트의 여러 표를 의미 단위로 분리
-2. 간트 배경색 → 텍스트 상태 변환 (예: `#00B050` → "완료")
+2. 간트 배경색 → 주변 범례를 참조하여 텍스트 상태 변환 (예: `#00B050` → "완료")
 3. 계층 구조를 들여쓰기/리스트로 표현
-4. 빈 행/구분 행 삭제
+4. 빈 행/구분 행/의미없는 구분선 삭제
 5. 가상 병합 처리 (반복값 → 첫 번째만 유지)
+6. 원본 언어 유지 (번역하지 않음)
+7. 청킹/임베딩을 고려한 Semantic 구조 출력
+8. 불필요한 설명 문구 없이 변환된 결과만 출력
+
+**이미지 요약 후처리 (`_ensure_image_summaries_md`):**
+
+Gemini 출력에만 의존하면 이미지 요약이 누락될 수 있으므로, 후처리로 확정적으로 반영합니다.
+
+| 상황 | 처리 |
+|---|---|
+| Gemini가 `![텍스트](filename)` 출력 | alt text를 `image_summary`로 교체 |
+| Gemini가 이미지를 누락 | 문서 끝에 `![summary](filename)` 추가 |
+| `--no-summary` (요약 없음) | alt text = "이미지" (기본값) |
+
+> **참고:** 현재 이 후처리는 MD 재구성에만 적용됩니다. HTML 재구성에는 미적용 상태입니다.
 
 ---
 

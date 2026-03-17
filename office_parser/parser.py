@@ -755,14 +755,29 @@ def _parse_xlsx(data: bytes, config: OfficeParserConfig) -> OfficeParserAST:
         # 테마 색상 팔레트 추출
         theme_colors = _extract_theme_colors(wb)
 
-        # 병합 셀 정보 수집: (row, col) -> colspan
+        # 병합 셀 정보 수집
+        # merged_spans: (row, col) -> colspan (0이면 스킵 대상)
+        # merged_values: (row, col) -> 주 셀의 값 (rowspan으로 인해 빈 셀에 값 채우기용)
         merged_spans = {}
+        merged_values = {}
         for mc in ws.merged_cells.ranges:
             colspan = mc.max_col - mc.min_col + 1
+            rowspan = mc.max_row - mc.min_row + 1
+            # 주 셀의 값 가져오기
+            primary_value = ws.cell(mc.min_row, mc.min_col).value
             if colspan > 1:
                 merged_spans[(mc.min_row, mc.min_col)] = colspan
                 for col in range(mc.min_col + 1, mc.max_col + 1):
-                    merged_spans[(mc.min_row, col)] = 0  # 병합된 나머지 셀은 스킵
+                    merged_spans[(mc.min_row, col)] = 0  # 같은 행 나머지 열 스킵
+            if rowspan > 1:
+                # 아래 행들의 같은 열에 주 셀 값 채우기 + 스킵 마킹
+                for r in range(mc.min_row + 1, mc.max_row + 1):
+                    merged_values[(r, mc.min_col)] = primary_value
+                    # colspan도 함께 전파
+                    if colspan > 1:
+                        merged_spans[(r, mc.min_col)] = colspan
+                    for col in range(mc.min_col + 1, mc.max_col + 1):
+                        merged_spans[(r, col)] = 0  # 병합 영역 나머지 열 스킵
 
         # 셀 데이터 — 빈 셀도 위치 유지를 위해 포함하되, 뒤쪽 빈 셀은 제거
         # 값이 있거나 배경색이 있는 셀을 유효한 셀로 취급 (간트차트 등 색칠만 된 셀 포함)
@@ -772,7 +787,7 @@ def _parse_xlsx(data: bytes, config: OfficeParserConfig) -> OfficeParserAST:
                 span = merged_spans.get((cell.row, cell.column))
                 if span == 0:
                     continue  # 병합된 나머지 셀
-                has_value = cell.value is not None
+                has_value = cell.value is not None or (cell.row, cell.column) in merged_values
                 has_fill = False
                 if cell.fill and cell.fill.fill_type == 'solid' and cell.fill.fgColor:
                     _rgb = str(cell.fill.fgColor.rgb)
@@ -795,8 +810,12 @@ def _parse_xlsx(data: bytes, config: OfficeParserConfig) -> OfficeParserAST:
                 style = _extract_cell_style(cell, theme_colors)
                 if style:
                     meta["style"] = style
+                # rowspan 병합된 셀: 주 셀의 값으로 채우기
+                cell_value = cell.value
+                if cell_value is None:
+                    cell_value = merged_values.get((cell.row, cell.column))
                 row_node.children.append(
-                    OfficeContentNode(type="cell", text=str(cell.value) if cell.value is not None else "", metadata=meta)
+                    OfficeContentNode(type="cell", text=str(cell_value) if cell_value is not None else "", metadata=meta)
                 )
             positioned.append((row_idx - 1, row_node))
 

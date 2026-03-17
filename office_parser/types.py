@@ -165,16 +165,20 @@ class OfficeParserAST:
         row_num = row_meta.get("row")
         cells = {}
         bg = {}
+        cs = {}
         for cell in (row.children or []):
             text = (cell.text or "").strip()
             meta = cell.metadata or {}
             col = meta.get("col", 0)
             col_key = str(col)
             cell_bg = meta.get("style", {}).get("background-color") if meta.get("style") else None
+            colspan = meta.get("colspan", 1) or 1
             if text:
                 cells[col_key] = text
             if cell_bg:
                 bg[col_key] = cell_bg
+            if colspan > 1:
+                cs[col_key] = colspan
         if not cells and not bg:
             return {}
         out = {}
@@ -184,6 +188,8 @@ class OfficeParserAST:
             out["cells"] = cells
         if bg:
             out["bg"] = bg
+        if cs:
+            out["cs"] = cs
         return out
 
     def _chart_to_compact(self, node: 'OfficeContentNode') -> dict:
