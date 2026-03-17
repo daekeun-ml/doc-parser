@@ -1,6 +1,32 @@
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Literal, Union
+from typing import Optional, List, Dict, Literal, Union, TypedDict
 from datetime import datetime
+
+
+# ── Reconstruct 관련 타입 ──
+
+class CompressedSheet(TypedDict):
+    sheet: str
+    meta: dict  # maxRow, maxCol, mergedCells, gap_rows, gap_cols, stats
+    cols: list  # ["r","c","v","b","bg","fg","cs"]
+    colDesc: dict
+    cells: list  # list of [row, col, value, bold, bg, fg, colspan]
+
+
+class TableRegion(TypedDict):
+    id: str
+    name: str
+    range: list  # [min_row, min_col, max_row, max_col]
+    cells: list
+
+
+class ReconstructedTable(TypedDict):
+    tableId: str
+    name: str
+    headers: Optional[list]
+    cols: list  # ["r","c","v","action"]
+    cells: list
+    structure: Optional[str]  # LLM이 판단한 구조 설명
 
 @dataclass
 class OfficeParserConfig:
@@ -15,6 +41,9 @@ class OfficeParserConfig:
     summarize: bool = True
     min_image_size: int = 150  # 이미지 요약 최소 크기 (px). 가로/세로 모두 이 값 이상이어야 요약
     gemini_model_id: str = "gemini-2.5-flash"
+    reconstruct: bool = False  # reconstruct 활성화
+    reconstruct_model: str = "gemini-2.5-flash"  # reconstruct용 모델
+    reconstruct_similarity_threshold: float = 0.7  # 파편 재결합 열 유사도 기준
 
 @dataclass
 class TextFormatting:
@@ -80,6 +109,161 @@ class OfficeParserAST:
     content: List[OfficeContentNode]
     attachments: List[OfficeAttachment] = field(default_factory=list)
     
+    def to_json_compact(self) -> str:
+        """RAG용 압축 JSON 변환. 빈 셀 제거, 헤더-값 매핑, 구조 보존."""
+        import json
+        result = {
+            "type": self.type,
+            "metadata": {},
+            "sheets": [],
+        }
+        if self.metadata.title:
+            result["metadata"]["title"] = self.metadata.title
+        if self.metadata.document_summary:
+            result["metadata"]["document_summary"] = self.metadata.document_summary
+
+        for node in self.content:
+            if node.type == "sheet":
+                result["sheets"].append(self._sheet_to_compact(node))
+            elif node.type == "slide":
+                result.setdefault("slides", []).append(self._slide_to_compact(node))
+            elif node.type == "page":
+                result.setdefault("pages", []).append(self._page_to_compact(node))
+            elif node.type == "section":
+                result.setdefault("sections", []).append(self._section_to_compact(node))
+            else:
+                result.setdefault("content", []).append(self._node_to_compact(node))
+
+        # 빈 리스트 제거
+        result = {k: v for k, v in result.items() if v}
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    def _sheet_to_compact(self, sheet: 'OfficeContentNode') -> dict:
+        meta = sheet.metadata or {}
+        out = {"sheet_name": meta.get("sheetName", "Sheet")}
+        if meta.get("sheet_summary"):
+            out["summary"] = meta["sheet_summary"]
+
+        content = []
+        for child in (sheet.children or []):
+            if child.type == "row" and child.children:
+                row_data = self._extract_row_compact(child)
+                if row_data:
+                    content.append(row_data)
+            elif child.type == "chart":
+                content.append(self._chart_to_compact(child))
+            elif child.type == "image":
+                content.append(self._image_to_compact(child))
+
+        if content:
+            out["rows"] = content
+        return out
+
+    def _extract_row_compact(self, row: 'OfficeContentNode') -> dict:
+        """행을 col 위치 기반 compact dict로 변환. 빈 셀 제거."""
+        row_meta = row.metadata or {}
+        row_num = row_meta.get("row")
+        cells = {}
+        bg = {}
+        for cell in (row.children or []):
+            text = (cell.text or "").strip()
+            meta = cell.metadata or {}
+            col = meta.get("col", 0)
+            col_key = str(col)
+            cell_bg = meta.get("style", {}).get("background-color") if meta.get("style") else None
+            if text:
+                cells[col_key] = text
+            if cell_bg:
+                bg[col_key] = cell_bg
+        if not cells and not bg:
+            return {}
+        out = {}
+        if row_num is not None:
+            out["r"] = row_num
+        if cells:
+            out["cells"] = cells
+        if bg:
+            out["bg"] = bg
+        return out
+
+    def _chart_to_compact(self, node: 'OfficeContentNode') -> dict:
+        meta = node.metadata or {}
+        out = {"type": "chart", "chart_type": meta.get("chartType", "")}
+        if meta.get("title"):
+            out["title"] = meta["title"]
+        return out
+
+    def _image_to_compact(self, node: 'OfficeContentNode') -> dict:
+        meta = node.metadata or {}
+        out = {"type": "image"}
+        if meta.get("filename"):
+            out["filename"] = meta["filename"]
+        if meta.get("image_summary"):
+            out["summary"] = meta["image_summary"]
+        return out
+
+    def _slide_to_compact(self, node: 'OfficeContentNode') -> dict:
+        meta = node.metadata or {}
+        out = {"slide": meta.get("slideNumber", 1)}
+        if meta.get("slideTitle"):
+            out["title"] = meta["slideTitle"]
+        if meta.get("slide_summary"):
+            out["summary"] = meta["slide_summary"]
+        children = []
+        for child in (node.children or []):
+            compact = self._node_to_compact(child)
+            if compact:
+                children.append(compact)
+        if children:
+            out["content"] = children
+        return out
+
+    def _page_to_compact(self, node: 'OfficeContentNode') -> dict:
+        out = {"page": (node.metadata or {}).get("pageNumber", 1)}
+        if node.text:
+            out["text"] = node.text
+        return out
+
+    def _section_to_compact(self, node: 'OfficeContentNode') -> dict:
+        meta = node.metadata or {}
+        out = {}
+        if meta.get("sectionTitle"):
+            out["title"] = meta["sectionTitle"]
+        if meta.get("section_summary"):
+            out["summary"] = meta["section_summary"]
+        children = []
+        for child in (node.children or []):
+            compact = self._node_to_compact(child)
+            if compact:
+                children.append(compact)
+        if children:
+            out["content"] = children
+        return out
+
+    def _node_to_compact(self, node: 'OfficeContentNode') -> dict:
+        if node.type in ("paragraph", "heading", "list", "notes"):
+            if not node.text:
+                return {}
+            out = {"type": node.type, "text": node.text}
+            if node.type == "heading" and node.metadata:
+                out["level"] = node.metadata.get("level", 1)
+            return out
+        elif node.type == "table":
+            rows = []
+            for row in (node.children or []):
+                if row.type == "row" and row.children:
+                    row_data = self._extract_row_compact(row)
+                    if row_data:
+                        rows.append(row_data)
+            return {"type": "table", "rows": rows} if rows else {}
+        elif node.type == "image":
+            return self._image_to_compact(node)
+        elif node.type == "chart":
+            return self._chart_to_compact(node)
+        elif node.text:
+            return {"text": node.text}
+        return {}
+
     def to_text(self, delimiter: str = "\n") -> str:
         def extract_text(nodes: List[OfficeContentNode]) -> str:
             texts = []
@@ -91,6 +275,50 @@ class OfficeParserAST:
             return delimiter.join(filter(None, texts))
         return extract_text(self.content)
     
+    def to_compressed_json(self, sheet_node: 'OfficeContentNode') -> CompressedSheet:
+        """시트 노드를 Schema+Values 압축 JSON으로 변환.
+
+        셀 배열 형식: [row, col, value, bold(1/0), bg_hex_or_0, fg_hex_or_0, colspan_or_0]
+        스타일 없음 = 0, 빈 값 = ""
+        """
+        meta = sheet_node.metadata or {}
+        sheet_name = meta.get("sheetName", "Sheet")
+        merged_cells = []
+
+        cells = []
+        for child in (sheet_node.children or []):
+            if child.type != "row" or not child.children:
+                continue
+            for cell_node in child.children:
+                cm = cell_node.metadata or {}
+                r = cm.get("row", 0)
+                c = cm.get("col", 0)
+                v = cell_node.text or ""
+                style = cm.get("style", {})
+                b = 1 if style.get("font-weight") == "bold" else 0
+                bg = style.get("background-color", 0) or 0
+                fg = style.get("color", 0) or 0
+                cs = cm.get("colspan", 0) or 0
+                if cs == 1:
+                    cs = 0
+                cells.append([r, c, v, b, bg, fg, cs])
+
+        return CompressedSheet(
+            sheet=sheet_name,
+            meta={
+                "maxRow": meta.get("maxRow", 0),
+                "maxCol": meta.get("maxColumn", 0),
+                "mergedCells": merged_cells,
+            },
+            cols=["r", "c", "v", "b", "bg", "fg", "cs"],
+            colDesc={
+                "r": "row", "c": "col", "v": "value",
+                "b": "bold(1/0)", "bg": "background hex or 0",
+                "fg": "font color hex or 0", "cs": "colspan or 0",
+            },
+            cells=cells,
+        )
+
     def to_markdown(self, image_dir: str = None) -> str:
         self._image_dir = image_dir
         self._heading_offset = 2 if self.metadata.document_summary else 0
@@ -115,21 +343,193 @@ class OfficeParserAST:
         """HTML 테이블 형태로 변환 (메타데이터 포함)"""
         self._image_dir = image_dir
         parts = []
-        
+
         if self.metadata.title:
             parts.append(f"<h1>{self.metadata.title}</h1>")
-        
+
         if self.metadata.document_summary:
             label = "Document Summary" if self.type == "docx" else "Deck Summary"
             parts.append(f"<h2>{label}</h2>\n<p>{self.metadata.document_summary}</p>")
             parts.append("<h2>Content</h2>")
-        
+
         for i, node in enumerate(self.content):
             if i > 0 and node.type == "sheet":
                 parts.append("<hr />")
             parts.append(self._node_to_html(node))
-        
-        return "\n".join(filter(None, parts))
+
+        body = "\n".join(filter(None, parts))
+        return self._wrap_html(body)
+
+    def _wrap_html(self, body: str) -> str:
+        """완성된 HTML 문서로 래핑 (CSS 테마 포함)"""
+        title = self.metadata.title or "Document"
+        return f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{title}</title>
+<style>
+:root {{
+  --bg: #f8f9fa;
+  --surface: #ffffff;
+  --border: #e2e8f0;
+  --text: #374151;
+  --text-secondary: #6b7280;
+  --accent: #2563eb;
+  --accent-light: #eff6ff;
+  --header-bg: #f1f5f9;
+  --header-text: #1f2937;
+  --summary-bg: #f0fdf4;
+  --summary-border: #86efac;
+  --image-summary-bg: #fefce8;
+  --image-summary-border: #fde047;
+  --table-summary-bg: #f5f3ff;
+  --table-summary-border: #c4b5fd;
+}}
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+body {{
+  font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.6;
+  padding: 2rem;
+}}
+.sheet, .slide {{
+  background: var(--surface);
+  border-radius: 12px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.06);
+  padding: 2rem;
+  margin-bottom: 2rem;
+}}
+h1 {{
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 1rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 2px solid var(--accent);
+}}
+h2 {{
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--text);
+  margin: 1.5rem 0 0.75rem;
+}}
+h3 {{
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--text);
+  margin: 1rem 0 0.5rem;
+}}
+hr {{
+  border: none;
+  height: 1px;
+  background: var(--border);
+  margin: 2rem 0;
+}}
+p {{
+  margin: 0.5rem 0;
+  color: var(--text);
+}}
+.sheet-summary {{
+  background: var(--summary-bg);
+  border-left: 4px solid var(--summary-border);
+  border-radius: 0 8px 8px 0;
+  padding: 1rem 1.25rem;
+  margin: 1rem 0 1.5rem;
+  font-size: 0.9rem;
+  color: var(--text-secondary);
+  line-height: 1.7;
+}}
+table {{
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0;
+  font-size: 0.85rem;
+}}
+table th, table td {{
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}}
+table th {{
+  background: var(--header-bg);
+  color: var(--header-text);
+  font-weight: 600;
+}}
+table tr:nth-child(even) td:not([style*="background"]) {{
+  background: #f8fafc;
+}}
+table tr:hover td {{
+  background: var(--accent-light) !important;
+  transition: background 0.15s;
+}}
+table.image-meta,
+table.section-meta,
+table.page-meta,
+table.table-meta,
+table.chart-meta {{
+  border: none;
+  margin: 0.75rem 0;
+  font-size: 0.85rem;
+}}
+table.image-meta td,
+table.section-meta td,
+table.page-meta td,
+table.table-meta td,
+table.chart-meta td {{
+  border: none;
+  padding: 0.4rem 0.75rem;
+}}
+table.image-meta {{ background: var(--image-summary-bg); border-left: 4px solid var(--image-summary-border); border-radius: 0 8px 8px 0; }}
+table.section-meta {{ background: var(--summary-bg); border-left: 4px solid var(--summary-border); border-radius: 0 8px 8px 0; }}
+table.page-meta {{ background: var(--accent-light); border-left: 4px solid var(--accent); border-radius: 0 8px 8px 0; }}
+table.table-meta {{ background: var(--table-summary-bg); border-left: 4px solid var(--table-summary-border); border-radius: 0 8px 8px 0; }}
+.image {{
+  margin: 1rem 0;
+  text-align: center;
+}}
+.image img {{
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+}}
+.image-summary {{
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  margin-top: 0.5rem;
+  font-style: italic;
+}}
+.chart {{
+  background: #fefce8;
+  border: 1px dashed #eab308;
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  margin: 0.75rem 0;
+  font-size: 0.9rem;
+}}
+blockquote.notes {{
+  background: #f1f5f9;
+  border-left: 4px solid var(--accent);
+  border-radius: 0 8px 8px 0;
+  padding: 0.75rem 1rem;
+  margin: 0.5rem 0;
+  color: var(--text-secondary);
+  font-style: italic;
+}}
+img {{
+  max-width: 100%;
+  height: auto;
+}}
+</style>
+</head>
+<body>
+{body}
+</body>
+</html>"""
     
     def _node_to_html(self, node: OfficeContentNode) -> str:
         if node.type == "sheet":

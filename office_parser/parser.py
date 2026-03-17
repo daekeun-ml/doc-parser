@@ -164,13 +164,23 @@ def _resolve_color(color_obj, theme_colors: list) -> str:
     return None
 
 
+_IGNORE_BG_COLORS = {'#FFFFFF', '#ffffff', '#000000', '#000000'}
+
+
+def _luminance(hex_color: str) -> float:
+    """#RRGGBB → 상대 밝기 (0=검정, 1=흰색)"""
+    h = hex_color.lstrip('#')
+    r, g, b = int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
+
 def _extract_cell_style(cell, theme_colors: list) -> dict:
-    """셀의 배경색, 글자색, 볼드 정보 추출"""
+    """셀의 배경색, 글자색, 볼드 정보 추출. 어두운 배경이면 글자색 자동 보정."""
     style = {}
     try:
         if cell.fill and cell.fill.fill_type == 'solid':
             bg = _resolve_color(cell.fill.fgColor, theme_colors)
-            if bg:
+            if bg and bg.upper() not in _IGNORE_BG_COLORS:
                 style['background-color'] = bg
         if cell.font:
             fc = _resolve_color(cell.font.color, theme_colors)
@@ -178,6 +188,14 @@ def _extract_cell_style(cell, theme_colors: list) -> dict:
                 style['color'] = fc
             if cell.font.bold:
                 style['font-weight'] = 'bold'
+        # 어두운 배경 + 어두운 글자 → 흰색으로 보정
+        bg_color = style.get('background-color')
+        if bg_color:
+            bg_lum = _luminance(bg_color)
+            fc_color = style.get('color', '#000000')
+            fc_lum = _luminance(fc_color)
+            if bg_lum < 0.4 and fc_lum < 0.4:
+                style['color'] = '#FFFFFF'
     except Exception:
         pass
     return style if style else None
@@ -747,14 +765,21 @@ def _parse_xlsx(data: bytes, config: OfficeParserConfig) -> OfficeParserAST:
                     merged_spans[(mc.min_row, col)] = 0  # 병합된 나머지 셀은 스킵
 
         # 셀 데이터 — 빈 셀도 위치 유지를 위해 포함하되, 뒤쪽 빈 셀은 제거
+        # 값이 있거나 배경색이 있는 셀을 유효한 셀로 취급 (간트차트 등 색칠만 된 셀 포함)
         for row_idx, row in enumerate(ws.iter_rows(), 1):
-            # 마지막으로 값이 있는 셀 위치 찾기 (병합 스킵 셀 제외)
             last_val_idx = -1
             for i, cell in enumerate(row):
                 span = merged_spans.get((cell.row, cell.column))
                 if span == 0:
                     continue  # 병합된 나머지 셀
-                if cell.value is not None:
+                has_value = cell.value is not None
+                has_fill = False
+                if cell.fill and cell.fill.fill_type == 'solid' and cell.fill.fgColor:
+                    _rgb = str(cell.fill.fgColor.rgb)
+                    if _rgb != '00000000':
+                        _hex = '#' + _rgb[2:]
+                        has_fill = _hex.upper() not in _IGNORE_BG_COLORS
+                if has_value or has_fill:
                     last_val_idx = i
             if last_val_idx < 0:
                 continue

@@ -42,7 +42,7 @@ def parse_single(
         image_dir = "pictures"
 
     # 출력 생성
-    ext_map = {"html": ".html", "markdown": ".md", "text": ".txt"}
+    ext_map = {"html": ".html", "markdown": ".md", "text": ".txt", "json": ".json"}
     out_ext = ext_map.get(output_format, ".json")
     out_path = doc_output / f"{file_path.stem}{out_ext}"
 
@@ -52,9 +52,26 @@ def parse_single(
         output = ast.to_markdown(image_dir=image_dir)
     elif output_format == "text":
         output = ast.to_text()
+    elif output_format == "json":
+        output = ast.to_json_compact()
     else:
         output = json.dumps(ast.__dict__, default=str, indent=2, ensure_ascii=False)
 
     out_path.write_text(output, encoding="utf-8")
+
+    # Gemini 기반 reconstruct (JSON → clean MD)
+    if config.reconstruct:
+        from office_parser.reconstructor import reconstruct_all_sheets
+        model_id = config.gemini_model_id
+
+        logger.info("🔄 [%s] Reconstructing to MD...", name)
+        try:
+            rc_md = reconstruct_all_sheets(ast, "md", model_id)
+            rc_md_path = doc_output / f"{file_path.stem}_reconstructed.md"
+            rc_md_path.write_text(rc_md, encoding="utf-8")
+            logger.info("✅ [%s] Reconstructed MD → %s", name, rc_md_path.name)
+        except Exception as e:
+            logger.error("❌ [%s] MD reconstruct failed: %s", name, e)
+
     logger.info("✅ [%s] Done → %s (%.1fs)", name, out_path, time.time() - t0)
     return out_path

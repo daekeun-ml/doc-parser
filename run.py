@@ -129,6 +129,7 @@ def parse_office(
     model_id: str,
     no_summary: bool,
     output_format: str = "markdown",
+    reconstruct: bool = False,
     verbose: bool = False,
 ) -> Path:
     """Parse a single Office file."""
@@ -139,6 +140,7 @@ def parse_office(
     config = OfficeParserConfig(
         summarize=not no_summary,
         gemini_model_id=model_id,
+        reconstruct=reconstruct,
     )
     return parse_single(str(file_path), config, output_format, str(output_dir))
 
@@ -151,6 +153,7 @@ def parse_single(
     no_summary: bool,
     table_mode: str,
     output_format: str,
+    reconstruct: bool = False,
     verbose: bool = False,
 ) -> Path:
     """Dispatch to PDF / Office parser based on file extension."""
@@ -159,7 +162,7 @@ def parse_single(
     if ext in PDF_EXTENSIONS:
         return parse_pdf(file_path, output_dir, model_id, no_summary, table_mode, verbose)
     elif ext in OFFICE_EXTENSIONS:
-        return parse_office(file_path, output_dir, model_id, no_summary, output_format, verbose)
+        return parse_office(file_path, output_dir, model_id, no_summary, output_format, reconstruct, verbose)
     else:
         raise ValueError(f"Unsupported file format: {ext}")
 
@@ -175,6 +178,8 @@ def main():
     parser.add_argument("--to-markdown", action="store_true", help="Office output format: markdown (default)")
     parser.add_argument("--to-html", action="store_true", help="Office output format: html")
     parser.add_argument("--to-text", action="store_true", help="Office output format: text")
+    parser.add_argument("--to-json", action="store_true", help="Office output format: compact JSON (RAG optimized)")
+    parser.add_argument("--reconstruct", action="store_true", help="Gemini로 JSON→clean MD/HTML 재구성")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable DEBUG logging")
     args = parser.parse_args()
 
@@ -182,13 +187,13 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     logger.info("🤖 Using model: %s", args.model_id)
 
-    output_format = "html" if args.to_html else "text" if args.to_text else "markdown"
+    output_format = "json" if args.to_json else "html" if args.to_html else "text" if args.to_text else "markdown"
 
     # Single file
     if args.input.is_file():
         parse_single(
             args.input, args.output, args.model_id, args.no_summary,
-            args.table_mode, output_format, args.verbose,
+            args.table_mode, output_format, args.reconstruct, args.verbose,
         )
         return
 

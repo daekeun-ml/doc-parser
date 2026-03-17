@@ -26,4 +26,6 @@ dependencies = [
     "python-dotenv>=1.2.2",
     # MCP server
     "fastmcp>=2.0.0",
+    "tiktoken>=0.12.0",
+    "pyyaml>=6.0.3",
 ]
