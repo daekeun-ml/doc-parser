@@ -68,6 +68,9 @@ def reconstruct_sheet(
     client = _get_gemini_client(model_id)
     result = _call_gemini(client, model_id, system, user)
 
+    if not result:
+        return ""
+
     # 코드 블록 래핑 제거
     if result.startswith("```markdown"):
         result = result[len("```markdown"):].strip()

@@ -175,8 +175,15 @@ class OfficeParserAST:
             colspan = meta.get("colspan", 1) or 1
             if text:
                 cells[col_key] = text
+                # colspan > 1이면 커버하는 모든 열에 값 복제
+                if colspan > 1:
+                    for c in range(col + 1, col + colspan):
+                        cells[str(c)] = text
             if cell_bg:
                 bg[col_key] = cell_bg
+                if colspan > 1:
+                    for c in range(col + 1, col + colspan):
+                        bg[str(c)] = cell_bg
             if colspan > 1:
                 cs[col_key] = colspan
         if not cells and not bg:
