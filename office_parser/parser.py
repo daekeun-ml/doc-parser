@@ -343,7 +343,7 @@ def _parse_docx(data: bytes, config: OfficeParserConfig) -> OfficeParserAST:
     ast = OfficeParserAST(type="docx", metadata=metadata, content=content,
                           attachments=attachments if attachments else None)
 
-    # ── Bedrock 요약 ──
+    # ── Gemini 요약 ──
     if config.summarize:
         # 1) 섹션별 요약 (병렬) — 섹션이 여러 개일 때만
         sections = [n for n in content if n.type == "section"]
@@ -566,7 +566,7 @@ def _parse_pptx(data: bytes, config: OfficeParserConfig) -> OfficeParserAST:
 
     metadata = OfficeMetadata(title=_clean_title(prs.core_properties.title), author=prs.core_properties.author)
 
-    # ── Bedrock 요약: 슬라이드 전체 이미지 기반 ──
+    # ── Gemini 요약: 슬라이드 전체 이미지 기반 ──
     if config.summarize:
         # LibreOffice로 슬라이드별 이미지 생성
         logger.info("🖼️ Converting slides to images (LibreOffice)...")
@@ -853,14 +853,15 @@ def _extract_sheet_text(sheet_node: OfficeContentNode) -> str:
     return "\n".join(texts)
 
 
-_bedrock_client_cache = {}
+_gemini_client_cache = {}
 
-def _get_bedrock_client(config: OfficeParserConfig):
-    import boto3
-    region = config.bedrock_region
-    if region not in _bedrock_client_cache:
-        _bedrock_client_cache[region] = boto3.client("bedrock-runtime", region_name=region)
-    return _bedrock_client_cache[region]
+def _get_gemini_client(config: OfficeParserConfig):
+    import os
+    from google import genai
+    model_id = config.gemini_model_id
+    if model_id not in _gemini_client_cache:
+        _gemini_client_cache[model_id] = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+    return _gemini_client_cache[model_id]
 
 
 def _is_large_image(img_data: bytes, min_size: int) -> bool:
@@ -874,51 +875,47 @@ def _is_large_image(img_data: bytes, min_size: int) -> bool:
 
 
 def _summarize_image(img_data: bytes, fmt: str, config: OfficeParserConfig, sheet_summary: str = "") -> str:
-    client = _get_bedrock_client(config)
-    media_type = f"image/{fmt}" if fmt != "jpg" else "image/jpeg"
-    b64 = base64.b64encode(img_data).decode("utf-8")
+    from google import genai
+    client = _get_gemini_client(config)
+    mime_type = f"image/{fmt}" if fmt != "jpg" else "image/jpeg"
 
     prompt = "Describe this image in detail in 3-5 sentences. Write in Korean."
     if sheet_summary:
         prompt = f"Context of the sheet containing this image: {sheet_summary}\n\nUsing the above context, describe this image in detail in 3-5 sentences. Write in Korean."
 
-    body = json.dumps({
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 500,
-        "messages": [{"role": "user", "content": [
-            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
-            {"type": "text", "text": prompt}
-        ]}]
-    })
-    resp = client.invoke_model(modelId=config.bedrock_model_id, body=body)
-    return json.loads(resp["body"].read())["content"][0]["text"]
+    response = client.models.generate_content(
+        model=config.gemini_model_id,
+        contents=[
+            genai.types.Part.from_bytes(data=img_data, mime_type=mime_type),
+            prompt,
+        ],
+    )
+    return response.text
 
 
 def _summarize_slide_image(img_data: bytes, slide_text: str, config: OfficeParserConfig) -> str:
     """슬라이드 전체 이미지 + 텍스트 컨텍스트로 요약"""
-    client = _get_bedrock_client(config)
-    b64 = base64.b64encode(img_data).decode("utf-8")
+    from google import genai
+    client = _get_gemini_client(config)
     prompt = "Summarize this presentation slide in 5-8 sentences. Cover the key points, and if there are diagrams, charts, or architecture figures, explain their meaning and relationships. Write in Korean."
     if slide_text:
         prompt += f"\n\nSlide text:\n{slide_text[:3000]}"
-    body = json.dumps({
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 800,
-        "messages": [{"role": "user", "content": [
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
-            {"type": "text", "text": prompt}
-        ]}]
-    })
-    resp = client.invoke_model(modelId=config.bedrock_model_id, body=body)
-    return json.loads(resp["body"].read())["content"][0]["text"]
+    response = client.models.generate_content(
+        model=config.gemini_model_id,
+        contents=[
+            genai.types.Part.from_bytes(data=img_data, mime_type="image/png"),
+            prompt,
+        ],
+    )
+    return response.text
 
 
 
-_DECK_SUMMARY_CHUNK_SIZE = 30000  # Bedrock 입력 제한 고려
+_DECK_SUMMARY_CHUNK_SIZE = 30000
 
 def _summarize_document(full_text: str, config: OfficeParserConfig, doc_type: str = "document") -> str:
     """전체 문서 텍스트를 청킹하여 요약 후 최종 요약 생성"""
-    client = _get_bedrock_client(config)
+    client = _get_gemini_client(config)
 
     if len(full_text) <= _DECK_SUMMARY_CHUNK_SIZE:
         chunks = [full_text]
@@ -930,13 +927,11 @@ def _summarize_document(full_text: str, config: OfficeParserConfig, doc_type: st
     for i, chunk in enumerate(chunks):
         prompt = (f"Below is part {i+1}/{len(chunks)} of a {doc_type}.\n"
                   f"Summarize the key points in 5-8 sentences. Write in Korean.\n\n{chunk}")
-        body = json.dumps({
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 1000,
-            "messages": [{"role": "user", "content": prompt}]
-        })
-        resp = client.invoke_model(modelId=config.bedrock_model_id, body=body)
-        summaries.append(json.loads(resp["body"].read())["content"][0]["text"])
+        response = client.models.generate_content(
+            model=config.gemini_model_id,
+            contents=prompt,
+        )
+        summaries.append(response.text)
 
     if len(summaries) == 1:
         return summaries[0]
@@ -944,40 +939,33 @@ def _summarize_document(full_text: str, config: OfficeParserConfig, doc_type: st
     combined = "\n\n".join(summaries)
     prompt = (f"Below are partial summaries of a {doc_type}.\n"
               "Create a final comprehensive summary in 5-10 sentences. Write in Korean.\n\n" + combined)
-    body = json.dumps({
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 1000,
-        "messages": [{"role": "user", "content": prompt}]
-    })
-    resp = client.invoke_model(modelId=config.bedrock_model_id, body=body)
-    return json.loads(resp["body"].read())["content"][0]["text"]
+    response = client.models.generate_content(
+        model=config.gemini_model_id,
+        contents=prompt,
+    )
+    return response.text
 
 def _summarize_text(text: str, sheet_name: str, config: OfficeParserConfig) -> str:
-    client = _get_bedrock_client(config)
+    client = _get_gemini_client(config)
     truncated = text[:4000]
-    body = json.dumps({
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 500,
-        "messages": [{"role": "user",
-                      "content": f"Below is the data from '{sheet_name}'. Summarize the content in 3-5 sentences. Write in Korean.\n\n{truncated}"}]
-    })
-    resp = client.invoke_model(modelId=config.bedrock_model_id, body=body)
-    return json.loads(resp["body"].read())["content"][0]["text"]
+    response = client.models.generate_content(
+        model=config.gemini_model_id,
+        contents=f"Below is the data from '{sheet_name}'. Summarize the content in 3-5 sentences. Write in Korean.\n\n{truncated}",
+    )
+    return response.text
 
 
 def _summarize_table(table_text: str, config: OfficeParserConfig, context: str = "") -> str:
-    client = _get_bedrock_client(config)
+    client = _get_gemini_client(config)
     prompt = "Summarize this table in 2-4 sentences. Describe what data it contains and key insights. Write in Korean."
     if context:
         prompt = f"Context of the section containing this table:\n{context[:2000]}\n\n{prompt}"
     prompt += f"\n\nTable:\n{table_text[:4000]}"
-    body = json.dumps({
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 500,
-        "messages": [{"role": "user", "content": prompt}]
-    })
-    resp = client.invoke_model(modelId=config.bedrock_model_id, body=body)
-    return json.loads(resp["body"].read())["content"][0]["text"]
+    response = client.models.generate_content(
+        model=config.gemini_model_id,
+        contents=prompt,
+    )
+    return response.text
 
 
 def _parse_pdf(data: bytes, config: OfficeParserConfig) -> OfficeParserAST:

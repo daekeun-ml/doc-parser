@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DEFAULT_MODEL_ID = os.getenv("MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
+DEFAULT_MODEL_ID = os.getenv("MODEL_ID", "gemini-2.5-flash")
 
 logger = logging.getLogger("doc_parser")
 
@@ -67,7 +67,7 @@ def parse_pdf(
     """Parse a single PDF → save final markdown."""
     _setup_logging(verbose)
     from pdf_parser.converter import DoclingConverter
-    from pdf_parser.summarizer import BedrockSummarizer
+    from pdf_parser.summarizer import GeminiSummarizer
     from pdf_parser.markdown_builder import MarkdownBuilder
 
     pdf_logger = logging.getLogger("pdf_parser")
@@ -96,7 +96,7 @@ def parse_pdf(
 
     page_summaries, image_summaries, table_summaries = {}, {}, {}
     if not no_summary:
-        summarizer = BedrockSummarizer(model_id=model_id)
+        summarizer = GeminiSummarizer(model_id=model_id)
 
         pdf_logger.info("🔍 [%s] Summarizing pages... (%d pages)", name, n_pages)
         t1 = time.time()
@@ -129,7 +129,6 @@ def parse_office(
     model_id: str,
     no_summary: bool,
     output_format: str = "markdown",
-    bedrock_region: str = "us-east-1",
     verbose: bool = False,
 ) -> Path:
     """Parse a single Office file."""
@@ -139,8 +138,7 @@ def parse_office(
 
     config = OfficeParserConfig(
         summarize=not no_summary,
-        bedrock_model_id=model_id,
-        bedrock_region=bedrock_region,
+        gemini_model_id=model_id,
     )
     return parse_single(str(file_path), config, output_format, str(output_dir))
 
@@ -153,7 +151,6 @@ def parse_single(
     no_summary: bool,
     table_mode: str,
     output_format: str,
-    bedrock_region: str,
     verbose: bool = False,
 ) -> Path:
     """Dispatch to PDF / Office parser based on file extension."""
@@ -162,7 +159,7 @@ def parse_single(
     if ext in PDF_EXTENSIONS:
         return parse_pdf(file_path, output_dir, model_id, no_summary, table_mode, verbose)
     elif ext in OFFICE_EXTENSIONS:
-        return parse_office(file_path, output_dir, model_id, no_summary, output_format, bedrock_region, verbose)
+        return parse_office(file_path, output_dir, model_id, no_summary, output_format, verbose)
     else:
         raise ValueError(f"Unsupported file format: {ext}")
 
@@ -173,12 +170,11 @@ def main():
     parser.add_argument("-o", "--output", type=Path, default=Path("output"), help="Output directory (default: output)")
     parser.add_argument("--workers", type=int, default=2, help="Parallel workers for folder mode (default: 2)")
     parser.add_argument("--no-summary", action="store_true", help="Disable LLM summarization")
-    parser.add_argument("--model-id", default=DEFAULT_MODEL_ID, help="Bedrock model ID (default: .env MODEL_ID)")
+    parser.add_argument("--model-id", default=DEFAULT_MODEL_ID, help="Gemini model ID (default: .env MODEL_ID)")
     parser.add_argument("--table-mode", choices=["accurate", "fast"], default="accurate", help="PDF TableFormer mode")
     parser.add_argument("--to-markdown", action="store_true", help="Office output format: markdown (default)")
     parser.add_argument("--to-html", action="store_true", help="Office output format: html")
     parser.add_argument("--to-text", action="store_true", help="Office output format: text")
-    parser.add_argument("--bedrock-region", default="us-east-1", help="Bedrock region")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable DEBUG logging")
     args = parser.parse_args()
 
@@ -192,7 +188,7 @@ def main():
     if args.input.is_file():
         parse_single(
             args.input, args.output, args.model_id, args.no_summary,
-            args.table_mode, output_format, args.bedrock_region, args.verbose,
+            args.table_mode, output_format, args.verbose,
         )
         return
 
@@ -211,7 +207,7 @@ def main():
             futs = {
                 ex.submit(
                     parse_single, f, args.output, args.model_id, args.no_summary,
-                    args.table_mode, output_format, args.bedrock_region, args.verbose,
+                    args.table_mode, output_format, args.verbose,
                 ): f
                 for f in files
             }
