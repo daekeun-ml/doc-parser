@@ -14,8 +14,7 @@ class OfficeParserConfig:
     ocr_language: str = "eng"
     summarize: bool = True
     min_image_size: int = 150  # 이미지 요약 최소 크기 (px). 가로/세로 모두 이 값 이상이어야 요약
-    bedrock_region: str = "us-east-1"
-    bedrock_model_id: str = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+    gemini_model_id: str = "gemini-2.5-flash"
 
 @dataclass
 class TextFormatting:
