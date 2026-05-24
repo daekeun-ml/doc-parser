@@ -1,14 +1,15 @@
-"""Bedrock 멀티모달 LLM을 이용한 페이지/이미지/테이블 요약."""
+"""Google Gemini 멀티모달 LLM을 이용한 페이지/이미지/테이블 요약."""
 
 from __future__ import annotations
 
 import base64
 import json
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 
-import boto3
+from google import genai
 
 from .utils import get_location
 
@@ -35,45 +36,33 @@ The page-level summary context may be provided below. Use it to produce a more a
 IMPORTANT: Write the summary value in Korean."""
 
 
-class BedrockSummarizer:
-    """Bedrock Claude 멀티모달 LLM으로 요약 생성."""
+class GeminiSummarizer:
+    """Google Gemini 멀티모달 LLM으로 요약 생성."""
 
     def __init__(
         self,
-        model_id: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        model_id: str = "gemini-2.5-flash",
         max_workers: int = 10,
-        region_name: str | None = None,
+        api_key: str | None = None,
     ):
         self.model_id = model_id
         self.max_workers = max_workers
-        kwargs = {}
-        if region_name:
-            kwargs["region_name"] = region_name
-        self._client = boto3.client("bedrock-runtime", **kwargs)
+        self._client = genai.Client(api_key=api_key or os.getenv("GOOGLE_API_KEY"))
 
     def _call_vision(self, img_pil, prompt: str) -> dict:
         """PIL 이미지 + 프롬프트 → JSON dict 반환."""
         buf = BytesIO()
         img_pil.save(buf, format="PNG")
-        img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        img_bytes = buf.getvalue()
 
-        resp = self._client.invoke_model(
-            modelId=self.model_id,
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps({
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 1024,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
-                        {"type": "text", "text": prompt},
-                    ],
-                }],
-            }),
+        response = self._client.models.generate_content(
+            model=self.model_id,
+            contents=[
+                genai.types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+                prompt,
+            ],
         )
-        text = json.loads(resp["body"].read())["content"][0]["text"].strip()
+        text = response.text.strip()
         if text.startswith("```"):
             text = text.split("\n", 1)[1].rsplit("```", 1)[0]
         return json.loads(text)

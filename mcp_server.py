@@ -17,13 +17,13 @@ from fastmcp.server.context import Context
 
 load_dotenv()
 
-DEFAULT_MODEL_ID = os.getenv("MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
+DEFAULT_MODEL_ID = os.getenv("MODEL_ID", "gemini-2.5-flash")
 
 mcp = FastMCP(
     name="doc-parser",
     instructions=(
         "PDF 및 Office(docx, pptx, xlsx) 문서에서 텍스트, 테이블, 이미지를 추출하고 "
-        "AWS Bedrock LLM으로 요약/엔티티를 생성하는 도구입니다."
+        "Google Gemini LLM으로 요약/엔티티를 생성하는 도구입니다."
     ),
 )
 
@@ -104,18 +104,16 @@ async def parse_document(
     no_summary: bool = False,
     table_mode: str = "accurate",
     output_format: str = "markdown",
-    bedrock_region: str = "us-east-1",
 ) -> str:
     """단일 문서를 파싱합니다.
 
     Args:
         file_path: 파싱할 문서 경로 (PDF 또는 Office 파일)
         output_dir: 결과 저장 디렉토리 (기본: output)
-        model_id: Bedrock 모델 ID
+        model_id: Gemini 모델 ID
         no_summary: True이면 LLM 요약을 비활성화
         table_mode: PDF 테이블 모드 (accurate 또는 fast)
         output_format: Office 출력 형식 (markdown, html, text)
-        bedrock_region: Bedrock 리전
     """
     from run import parse_single
 
@@ -135,7 +133,7 @@ async def parse_document(
             ctx,
             parse_single,
             fp, Path(output_dir), model_id, no_summary,
-            table_mode, output_format, bedrock_region,
+            table_mode, output_format,
         )
         elapsed = time.time() - t0
         await ctx.info(f"🎉 파싱 완료: {fp.name} ({elapsed:.1f}초)")
@@ -162,7 +160,6 @@ async def parse_directory(
     no_summary: bool = False,
     table_mode: str = "accurate",
     output_format: str = "markdown",
-    bedrock_region: str = "us-east-1",
 ) -> str:
     """폴더 내 문서를 일괄 파싱합니다.
 
@@ -170,11 +167,10 @@ async def parse_directory(
         dir_path: 문서가 들어있는 폴더 경로
         output_dir: 결과 저장 디렉토리 (기본: output)
         workers: 병렬 처리 워커 수 (기본: 2)
-        model_id: Bedrock 모델 ID
+        model_id: Gemini 모델 ID
         no_summary: True이면 LLM 요약을 비활성화
         table_mode: PDF 테이블 모드 (accurate 또는 fast)
         output_format: Office 출력 형식 (markdown, html, text)
-        bedrock_region: Bedrock 리전
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from run import parse_single
@@ -199,7 +195,7 @@ async def parse_directory(
             futs = {
                 ex.submit(
                     parse_single, f, out, model_id, no_summary,
-                    table_mode, output_format, bedrock_region,
+                    table_mode, output_format,
                 ): f
                 for f in files
             }

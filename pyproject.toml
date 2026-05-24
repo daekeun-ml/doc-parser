@@ -21,9 +21,11 @@ dependencies = [
     "pdfplumber>=0.10.0",
     "striprtf>=0.0.26",
     "pytesseract>=0.3.10",
-    "boto3>=1.28.0",
+    "google-genai>=1.0.0",
     "pdf2image>=1.17.0",
     "python-dotenv>=1.2.2",
     # MCP server
     "fastmcp>=2.0.0",
+    "tiktoken>=0.12.0",
+    "pyyaml>=6.0.3",
 ]

@@ -164,13 +164,23 @@ def _resolve_color(color_obj, theme_colors: list) -> str:
     return None
 
 
+_IGNORE_BG_COLORS = {'#FFFFFF', '#ffffff', '#000000', '#000000'}
+
+
+def _luminance(hex_color: str) -> float:
+    """#RRGGBB → 상대 밝기 (0=검정, 1=흰색)"""
+    h = hex_color.lstrip('#')
+    r, g, b = int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
+
 def _extract_cell_style(cell, theme_colors: list) -> dict:
-    """셀의 배경색, 글자색, 볼드 정보 추출"""
+    """셀의 배경색, 글자색, 볼드 정보 추출. 어두운 배경이면 글자색 자동 보정."""
     style = {}
     try:
         if cell.fill and cell.fill.fill_type == 'solid':
             bg = _resolve_color(cell.fill.fgColor, theme_colors)
-            if bg:
+            if bg and bg.upper() not in _IGNORE_BG_COLORS:
                 style['background-color'] = bg
         if cell.font:
             fc = _resolve_color(cell.font.color, theme_colors)
@@ -178,6 +188,14 @@ def _extract_cell_style(cell, theme_colors: list) -> dict:
                 style['color'] = fc
             if cell.font.bold:
                 style['font-weight'] = 'bold'
+        # 어두운 배경 + 어두운 글자 → 흰색으로 보정
+        bg_color = style.get('background-color')
+        if bg_color:
+            bg_lum = _luminance(bg_color)
+            fc_color = style.get('color', '#000000')
+            fc_lum = _luminance(fc_color)
+            if bg_lum < 0.4 and fc_lum < 0.4:
+                style['color'] = '#FFFFFF'
     except Exception:
         pass
     return style if style else None
@@ -343,7 +361,7 @@ def _parse_docx(data: bytes, config: OfficeParserConfig) -> OfficeParserAST:
     ast = OfficeParserAST(type="docx", metadata=metadata, content=content,
                           attachments=attachments if attachments else None)
 
-    # ── Bedrock 요약 ──
+    # ── Gemini 요약 ──
     if config.summarize:
         # 1) 섹션별 요약 (병렬) — 섹션이 여러 개일 때만
         sections = [n for n in content if n.type == "section"]
@@ -566,7 +584,7 @@ def _parse_pptx(data: bytes, config: OfficeParserConfig) -> OfficeParserAST:
 
     metadata = OfficeMetadata(title=_clean_title(prs.core_properties.title), author=prs.core_properties.author)
 
-    # ── Bedrock 요약: 슬라이드 전체 이미지 기반 ──
+    # ── Gemini 요약: 슬라이드 전체 이미지 기반 ──
     if config.summarize:
         # LibreOffice로 슬라이드별 이미지 생성
         logger.info("🖼️ Converting slides to images (LibreOffice)...")
@@ -737,24 +755,46 @@ def _parse_xlsx(data: bytes, config: OfficeParserConfig) -> OfficeParserAST:
         # 테마 색상 팔레트 추출
         theme_colors = _extract_theme_colors(wb)
 
-        # 병합 셀 정보 수집: (row, col) -> colspan
+        # 병합 셀 정보 수집
+        # merged_spans: (row, col) -> colspan (0이면 스킵 대상)
+        # merged_values: (row, col) -> 주 셀의 값 (rowspan으로 인해 빈 셀에 값 채우기용)
         merged_spans = {}
+        merged_values = {}
         for mc in ws.merged_cells.ranges:
             colspan = mc.max_col - mc.min_col + 1
+            rowspan = mc.max_row - mc.min_row + 1
+            # 주 셀의 값 가져오기
+            primary_value = ws.cell(mc.min_row, mc.min_col).value
             if colspan > 1:
                 merged_spans[(mc.min_row, mc.min_col)] = colspan
                 for col in range(mc.min_col + 1, mc.max_col + 1):
-                    merged_spans[(mc.min_row, col)] = 0  # 병합된 나머지 셀은 스킵
+                    merged_spans[(mc.min_row, col)] = 0  # 같은 행 나머지 열 스킵
+            if rowspan > 1:
+                # 아래 행들의 같은 열에 주 셀 값 채우기 + 스킵 마킹
+                for r in range(mc.min_row + 1, mc.max_row + 1):
+                    merged_values[(r, mc.min_col)] = primary_value
+                    # colspan도 함께 전파
+                    if colspan > 1:
+                        merged_spans[(r, mc.min_col)] = colspan
+                    for col in range(mc.min_col + 1, mc.max_col + 1):
+                        merged_spans[(r, col)] = 0  # 병합 영역 나머지 열 스킵
 
         # 셀 데이터 — 빈 셀도 위치 유지를 위해 포함하되, 뒤쪽 빈 셀은 제거
+        # 값이 있거나 배경색이 있는 셀을 유효한 셀로 취급 (간트차트 등 색칠만 된 셀 포함)
         for row_idx, row in enumerate(ws.iter_rows(), 1):
-            # 마지막으로 값이 있는 셀 위치 찾기 (병합 스킵 셀 제외)
             last_val_idx = -1
             for i, cell in enumerate(row):
                 span = merged_spans.get((cell.row, cell.column))
                 if span == 0:
                     continue  # 병합된 나머지 셀
-                if cell.value is not None:
+                has_value = cell.value is not None or (cell.row, cell.column) in merged_values
+                has_fill = False
+                if cell.fill and cell.fill.fill_type == 'solid' and cell.fill.fgColor:
+                    _rgb = str(cell.fill.fgColor.rgb)
+                    if _rgb != '00000000':
+                        _hex = '#' + _rgb[2:]
+                        has_fill = _hex.upper() not in _IGNORE_BG_COLORS
+                if has_value or has_fill:
                     last_val_idx = i
             if last_val_idx < 0:
                 continue
@@ -770,8 +810,12 @@ def _parse_xlsx(data: bytes, config: OfficeParserConfig) -> OfficeParserAST:
                 style = _extract_cell_style(cell, theme_colors)
                 if style:
                     meta["style"] = style
+                # rowspan 병합된 셀: 주 셀의 값으로 채우기
+                cell_value = cell.value
+                if cell_value is None:
+                    cell_value = merged_values.get((cell.row, cell.column))
                 row_node.children.append(
-                    OfficeContentNode(type="cell", text=str(cell.value) if cell.value is not None else "", metadata=meta)
+                    OfficeContentNode(type="cell", text=str(cell_value) if cell_value is not None else "", metadata=meta)
                 )
             positioned.append((row_idx - 1, row_node))
 
@@ -853,14 +897,15 @@ def _extract_sheet_text(sheet_node: OfficeContentNode) -> str:
     return "\n".join(texts)
 
 
-_bedrock_client_cache = {}
+_gemini_client_cache = {}
 
-def _get_bedrock_client(config: OfficeParserConfig):
-    import boto3
-    region = config.bedrock_region
-    if region not in _bedrock_client_cache:
-        _bedrock_client_cache[region] = boto3.client("bedrock-runtime", region_name=region)
-    return _bedrock_client_cache[region]
+def _get_gemini_client(config: OfficeParserConfig):
+    import os
+    from google import genai
+    model_id = config.gemini_model_id
+    if model_id not in _gemini_client_cache:
+        _gemini_client_cache[model_id] = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+    return _gemini_client_cache[model_id]
 
 
 def _is_large_image(img_data: bytes, min_size: int) -> bool:
@@ -874,51 +919,47 @@ def _is_large_image(img_data: bytes, min_size: int) -> bool:
 
 
 def _summarize_image(img_data: bytes, fmt: str, config: OfficeParserConfig, sheet_summary: str = "") -> str:
-    client = _get_bedrock_client(config)
-    media_type = f"image/{fmt}" if fmt != "jpg" else "image/jpeg"
-    b64 = base64.b64encode(img_data).decode("utf-8")
+    from google import genai
+    client = _get_gemini_client(config)
+    mime_type = f"image/{fmt}" if fmt != "jpg" else "image/jpeg"
 
     prompt = "Describe this image in detail in 3-5 sentences. Write in Korean."
     if sheet_summary:
         prompt = f"Context of the sheet containing this image: {sheet_summary}\n\nUsing the above context, describe this image in detail in 3-5 sentences. Write in Korean."
 
-    body = json.dumps({
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 500,
-        "messages": [{"role": "user", "content": [
-            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
-            {"type": "text", "text": prompt}
-        ]}]
-    })
-    resp = client.invoke_model(modelId=config.bedrock_model_id, body=body)
-    return json.loads(resp["body"].read())["content"][0]["text"]
+    response = client.models.generate_content(
+        model=config.gemini_model_id,
+        contents=[
+            genai.types.Part.from_bytes(data=img_data, mime_type=mime_type),
+            prompt,
+        ],
+    )
+    return response.text
 
 
 def _summarize_slide_image(img_data: bytes, slide_text: str, config: OfficeParserConfig) -> str:
     """슬라이드 전체 이미지 + 텍스트 컨텍스트로 요약"""
-    client = _get_bedrock_client(config)
-    b64 = base64.b64encode(img_data).decode("utf-8")
+    from google import genai
+    client = _get_gemini_client(config)
     prompt = "Summarize this presentation slide in 5-8 sentences. Cover the key points, and if there are diagrams, charts, or architecture figures, explain their meaning and relationships. Write in Korean."
     if slide_text:
         prompt += f"\n\nSlide text:\n{slide_text[:3000]}"
-    body = json.dumps({
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 800,
-        "messages": [{"role": "user", "content": [
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
-            {"type": "text", "text": prompt}
-        ]}]
-    })
-    resp = client.invoke_model(modelId=config.bedrock_model_id, body=body)
-    return json.loads(resp["body"].read())["content"][0]["text"]
+    response = client.models.generate_content(
+        model=config.gemini_model_id,
+        contents=[
+            genai.types.Part.from_bytes(data=img_data, mime_type="image/png"),
+            prompt,
+        ],
+    )
+    return response.text
 
 
 
-_DECK_SUMMARY_CHUNK_SIZE = 30000  # Bedrock 입력 제한 고려
+_DECK_SUMMARY_CHUNK_SIZE = 30000
 
 def _summarize_document(full_text: str, config: OfficeParserConfig, doc_type: str = "document") -> str:
     """전체 문서 텍스트를 청킹하여 요약 후 최종 요약 생성"""
-    client = _get_bedrock_client(config)
+    client = _get_gemini_client(config)
 
     if len(full_text) <= _DECK_SUMMARY_CHUNK_SIZE:
         chunks = [full_text]
@@ -930,13 +971,11 @@ def _summarize_document(full_text: str, config: OfficeParserConfig, doc_type: st
     for i, chunk in enumerate(chunks):
         prompt = (f"Below is part {i+1}/{len(chunks)} of a {doc_type}.\n"
                   f"Summarize the key points in 5-8 sentences. Write in Korean.\n\n{chunk}")
-        body = json.dumps({
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 1000,
-            "messages": [{"role": "user", "content": prompt}]
-        })
-        resp = client.invoke_model(modelId=config.bedrock_model_id, body=body)
-        summaries.append(json.loads(resp["body"].read())["content"][0]["text"])
+        response = client.models.generate_content(
+            model=config.gemini_model_id,
+            contents=prompt,
+        )
+        summaries.append(response.text)
 
     if len(summaries) == 1:
         return summaries[0]
@@ -944,40 +983,33 @@ def _summarize_document(full_text: str, config: OfficeParserConfig, doc_type: st
     combined = "\n\n".join(summaries)
     prompt = (f"Below are partial summaries of a {doc_type}.\n"
               "Create a final comprehensive summary in 5-10 sentences. Write in Korean.\n\n" + combined)
-    body = json.dumps({
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 1000,
-        "messages": [{"role": "user", "content": prompt}]
-    })
-    resp = client.invoke_model(modelId=config.bedrock_model_id, body=body)
-    return json.loads(resp["body"].read())["content"][0]["text"]
+    response = client.models.generate_content(
+        model=config.gemini_model_id,
+        contents=prompt,
+    )
+    return response.text
 
 def _summarize_text(text: str, sheet_name: str, config: OfficeParserConfig) -> str:
-    client = _get_bedrock_client(config)
+    client = _get_gemini_client(config)
     truncated = text[:4000]
-    body = json.dumps({
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 500,
-        "messages": [{"role": "user",
-                      "content": f"Below is the data from '{sheet_name}'. Summarize the content in 3-5 sentences. Write in Korean.\n\n{truncated}"}]
-    })
-    resp = client.invoke_model(modelId=config.bedrock_model_id, body=body)
-    return json.loads(resp["body"].read())["content"][0]["text"]
+    response = client.models.generate_content(
+        model=config.gemini_model_id,
+        contents=f"Below is the data from '{sheet_name}'. Summarize the content in 3-5 sentences. Write in Korean.\n\n{truncated}",
+    )
+    return response.text
 
 
 def _summarize_table(table_text: str, config: OfficeParserConfig, context: str = "") -> str:
-    client = _get_bedrock_client(config)
+    client = _get_gemini_client(config)
     prompt = "Summarize this table in 2-4 sentences. Describe what data it contains and key insights. Write in Korean."
     if context:
         prompt = f"Context of the section containing this table:\n{context[:2000]}\n\n{prompt}"
     prompt += f"\n\nTable:\n{table_text[:4000]}"
-    body = json.dumps({
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 500,
-        "messages": [{"role": "user", "content": prompt}]
-    })
-    resp = client.invoke_model(modelId=config.bedrock_model_id, body=body)
-    return json.loads(resp["body"].read())["content"][0]["text"]
+    response = client.models.generate_content(
+        model=config.gemini_model_id,
+        contents=prompt,
+    )
+    return response.text
 
 
 def _parse_pdf(data: bytes, config: OfficeParserConfig) -> OfficeParserAST:
